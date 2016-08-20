@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"flag"
 )
 
 type Msg struct {
@@ -31,23 +32,12 @@ func lineReader(ch chan<- Msg, index int, rdr io.ReadCloser) {
 	}
 }
 
-func spawnReader(filename string, index int, ch chan<- Msg) error {
-	f, err := os.Open(filename)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: can't open: %s: %v", filename, err)
-		return err
-	}
-
-	go lineReader(ch, index, f)
-	return nil
-}
-
 type Format struct {
 	pieces	[]string
 	inputs	map[int]int	// input index -> piece index
 }
 
-func MakeFormat(str string) (Format, error) {
+func makeFormat(str string) (Format, error) {
 	pieces := []string{}
 	inputs := make(map[int]int)
 
@@ -57,21 +47,23 @@ func MakeFormat(str string) (Format, error) {
 	}
 
 	for {
+		// here, `str` points to the remaining part of the format string;
 		loc := markerRe.FindStringIndex(str)
 		if len(loc) == 0 {
 			break
 		}
-
+		
+		// `loc[0]` and `loc[1]` are the start and end index of the marker (e.g. "%3") in `str`
+		
 		marker := str[loc[0] : loc[1]]
-
 		fileIndex, err := strconv.Atoi(marker[1:])
 		if err != nil {
 			return Format{}, err
 		}
 
+		// the empty string will be replaced with a line of text from the corresponding file
 		pieces = append(pieces, str[0 : loc[0]], "")
 		inputs[fileIndex] = len(pieces) - 1
-
 		str = str[loc[1] : ]
 	}
 
@@ -91,27 +83,89 @@ func (f *Format) SetInput(index int, content string) {
 	f.pieces[f.inputs[index]] = content
 }
 
-const usage = "Usage: mux <format string> <file0> [file1 ... fileN]"
+
+type IndexSet []int
+
+func (me *IndexSet) String() string {
+	var strs []string
+	for _, index := range *me {
+		strs = append(strs, strconv.Itoa(index))
+	}
+	return strings.Join(strs, ",")
+}
+
+// this method will parse the list of indices passed from the command line
+func (me *IndexSet) Set(s string) error {
+	iset := IndexSet{}
+	toks := strings.Split(s, ",")
+	for _, fileIndexStr := range toks {
+		fileIndex, err := strconv.Atoi(fileIndexStr)
+		if err != nil {
+			fmt.Println("parse error: ", err)
+			return err
+		}
+		iset = append(iset, fileIndex)
+	}
+
+	*me = iset
+	return nil
+}
+
+func (me *IndexSet) Find(index int) int {
+	for i, item := range *me {
+		if index == item {
+			return i
+		}
+	}
+	return -1
+}
+
+
+var killingSet = IndexSet{}
+
+func init() {
+	flag.Var(&killingSet, "k",
+		"Indices of the files which, when closed, cause the program to quit")
+}
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println(usage)
+	flag.Usage = func() {
+		fmt.Println("Usage: mux [-k 0,1,...] <format string> <file0> [file1 ... fileN]")
+		flag.PrintDefaults()
+	}
+
+
+	flag.Parse()
+	if flag.NArg() < 2 {
+		flag.Usage()
 		return
 	}
 
-	ch := make(chan Msg)
-
-	format, err := MakeFormat(os.Args[1])
+	format, err := makeFormat(flag.Arg(0))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: ", err)
 		return
 	}
 
-	for i := 2; i < len(os.Args); i++ {
-		err := spawnReader(os.Args[i], i - 2, ch)
+	// one line-reading coroutine is spawned for each input file;
+	// all of them send Msgs to the same channel; 
+	// the Msgs are received by the main loop at the end
+	
+	ch := make(chan Msg)
+	var files []io.ReadCloser
+	
+	args := flag.Args()
+	for _, arg := range args[1:] {
+		f, err := os.Open(arg)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "spawn error: ", err)
+			fmt.Fprintln(os.Stderr, err)
+			return
 		}
+		files = append(files, f)
+	}
+	
+	for i, file := range files {
+		go lineReader(ch, i, file)
 	}
 
 	for {
@@ -122,6 +176,9 @@ func main() {
 			}
 
 			if msg.err != nil {
+				if msg.err == io.EOF && killingSet.Find(msg.index) != -1 {
+					return
+				}
 				format.SetInput(msg.index, fmt.Sprintf("(%v)", msg.err))
 			} else {
 				format.SetInput(msg.index, msg.str)
